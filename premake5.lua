@@ -85,6 +85,8 @@ workspace "GTAIV.EFLC.FusionFix"
    includedirs { "external/inireader" }
    includedirs { "external/modupdater/dist" }
    includedirs { "external/openxr/include" }
+   includedirs { "external/dxvk-interop" }
+   includedirs { "external/vulkan-headers/include" }
    includedirs { "source/gxt/src" }
    libdirs { "external/modupdater/dist" }
    files { "external/hooking/Hooking.Patterns.h", "external/hooking/Hooking.Patterns.cpp" }

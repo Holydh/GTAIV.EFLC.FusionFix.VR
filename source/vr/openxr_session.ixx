@@ -1,5 +1,7 @@
 // in vr/openxr_session.ixx
 module;
+#define XR_USE_GRAPHICS_API_VULKAN
+#include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
 #include <vector>
@@ -86,14 +88,16 @@ bool OpenXRSession::CreateInstance() {
     std::vector<const char*> enabledExtensions;
     
     // Vulkan binding (for DXVK path)
-    //if (hasExtension(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) {
-    //    enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
-    //} else if (hasExtension(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME)) {
-    //    enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
-    //} else {
-    //    LogError("No Vulkan binding available — OpenXR runtime doesn't support Vulkan?");
-    //    return false;
-    //}
+    if (hasExtension(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) {
+        enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME);
+        LogInfo("Using Vulkan binding (KHR_vulkan_enable2)");
+    } else if (hasExtension(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME)) {
+        enabledExtensions.push_back(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME);
+        LogInfo("Using Vulkan binding (KHR_vulkan_enable - legacy)");
+    } else {
+        LogError("No Vulkan binding available — OpenXR runtime doesn't support Vulkan?");
+        return false;
+    }
     
     // Debug messenger (extremely useful)
     bool hasDebugUtils = hasExtension(XR_EXT_DEBUG_UTILS_EXTENSION_NAME);
