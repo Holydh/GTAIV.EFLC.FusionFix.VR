@@ -9,6 +9,7 @@ module;
 
 export module VR.OpenXRSession;
 import VR.Log;
+import VR.DXVKInterop;
 
 // OpenXR returns XrResult for nearly every call. Macro :
 #define XR_CHECK(call) do { \
@@ -31,24 +32,22 @@ public:
     
     bool IsAvailable() const { return instance != XR_NULL_HANDLE && systemId != XR_NULL_SYSTEM_ID; }
     const std::string& GetSystemName() const { return systemName; }
+
+    bool CreateSession(const VulkanDeviceHandles& vk);
 private :
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
     XrDebugUtilsMessengerEXT debugMessenger = XR_NULL_HANDLE;
     std::string systemName;
-    
+
+	XrSession session = XR_NULL_HANDLE;
+	XrSpace referenceSpace = XR_NULL_HANDLE;
+	VulkanDeviceHandles vkHandles;
+
     bool CreateInstance();
     bool SetupDebugMessenger();
     bool QuerySystem();
-    void LogRuntimeInfo();
 };
-
-//bool OpenXRSession::CreateInstance() {
-//    LogInfo("Enumerating OpenXR layers...");
-//    
-//    LogInfo("OpenXR instance created successfully");
-//    return true;
-//}
 
 bool OpenXRSession::CreateInstance() {
     // Enumerate API layers (validation, etc.)
@@ -245,6 +244,15 @@ bool OpenXRSession::InitializeInstance() {
 }
 
 void OpenXRSession::Shutdown() {
+    if (referenceSpace != XR_NULL_HANDLE) {
+        xrDestroySpace(referenceSpace);
+        referenceSpace = XR_NULL_HANDLE;
+    }
+    if (session != XR_NULL_HANDLE) {
+        xrDestroySession(session);
+        session = XR_NULL_HANDLE;
+    }
+
     if (debugMessenger != XR_NULL_HANDLE) {
         PFN_xrDestroyDebugUtilsMessengerEXT destroyMessenger = nullptr;
         xrGetInstanceProcAddr(instance, "xrDestroyDebugUtilsMessengerEXT",
@@ -257,4 +265,71 @@ void OpenXRSession::Shutdown() {
         instance = XR_NULL_HANDLE;
     }
     systemId = XR_NULL_SYSTEM_ID;
+}
+
+bool OpenXRSession::CreateSession(const VulkanDeviceHandles& vk) {
+    vkHandles = vk;
+    
+    // 1. Required by spec: query graphics requirements
+    PFN_xrGetVulkanGraphicsRequirements2KHR pfnGetReqs = nullptr;
+    XR_CHECK(xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsRequirements2KHR",
+        reinterpret_cast<PFN_xrVoidFunction*>(&pfnGetReqs)));
+    
+    XrGraphicsRequirementsVulkanKHR reqs{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR};
+    XR_CHECK(pfnGetReqs(instance, systemId, &reqs));
+    LogInfo("OpenXR Vulkan requirements: min v%u.%u.%u, max v%u.%u.%u",
+        XR_VERSION_MAJOR(reqs.minApiVersionSupported),
+        XR_VERSION_MINOR(reqs.minApiVersionSupported),
+        XR_VERSION_PATCH(reqs.minApiVersionSupported),
+        XR_VERSION_MAJOR(reqs.maxApiVersionSupported),
+        XR_VERSION_MINOR(reqs.maxApiVersionSupported),
+        XR_VERSION_PATCH(reqs.maxApiVersionSupported));
+    
+    // 2. Create session with DXVK Vulkan handles
+    XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
+    binding.instance         = vk.instance;
+    binding.physicalDevice   = vk.physicalDevice;
+    binding.device           = vk.device;
+    binding.queueFamilyIndex = vk.queueFamilyIndex;
+    binding.queueIndex       = vk.queueIndex;
+    
+    XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
+    sci.next     = &binding;
+    sci.systemId = systemId;
+    
+    XR_CHECK(xrCreateSession(instance, &sci, &session));
+    LogInfo("OpenXR session created: %p", (void*)session);
+    
+    // 3. Enumerate reference spaces (informational)
+    uint32_t spaceCount = 0;
+    XR_CHECK(xrEnumerateReferenceSpaces(session, 0, &spaceCount, nullptr));
+    std::vector<XrReferenceSpaceType> spaces(spaceCount);
+    XR_CHECK(xrEnumerateReferenceSpaces(session, spaceCount, &spaceCount, spaces.data()));
+    
+    bool hasLocal = false, hasStage = false, hasView = false;
+    for (auto s : spaces) {
+        if (s == XR_REFERENCE_SPACE_TYPE_LOCAL) hasLocal = true;
+        if (s == XR_REFERENCE_SPACE_TYPE_STAGE) hasStage = true;
+        if (s == XR_REFERENCE_SPACE_TYPE_VIEW)  hasView  = true;
+    }
+    LogInfo("Reference spaces: LOCAL=%d STAGE=%d VIEW=%d", hasLocal, hasStage, hasView);
+    
+    if (!hasLocal) {
+        LogError("LOCAL reference space not supported - cannot proceed");
+        return false;
+    }
+    
+    // 4. Create LOCAL reference space at identity pose
+    XrReferenceSpaceCreateInfo rsci{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+    rsci.referenceSpaceType   = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    rsci.poseInReferenceSpace = XrPosef{
+        {0.0f, 0.0f, 0.0f, 1.0f},  // orientation (quaternion identity)
+        {0.0f, 0.0f, 0.0f}          // position
+    };
+    
+    XR_CHECK(xrCreateReferenceSpace(session, &rsci, &referenceSpace));
+    LogInfo("Reference space created (LOCAL): %p", (void*)referenceSpace);
+    
+    LogInfo("OpenXR Milestone 2 complete: session + reference space ready");
+    return true;
 }
