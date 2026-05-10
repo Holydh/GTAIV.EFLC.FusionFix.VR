@@ -1,13 +1,11 @@
 // vr_manager.ixx
 module;
 
-#include <common.hxx>  // FusionFix headers, etc.
-
 export module VR.Manager;
 
 import common;
 import VR.Log;
-import VR.OpenXRSession;  // defines class OpenXRSession
+import VR.OpenXRSession; // defines class OpenXRSession
 
 namespace {
     OpenXRSession g_VRSession;
@@ -15,7 +13,7 @@ namespace {
     void VRMod_Init() {
         VRLog_Init();
         LogInfo("VR mod loading...");
-        if (g_VRSession.CreateInstance()) {
+        if (g_VRSession.InitializeInstance()) {
             LogInfo("OpenXR ready");
         } else {
             LogError("OpenXR init failed - VR disabled");
@@ -24,7 +22,7 @@ namespace {
 
     void VRMod_Shutdown() {
         LogInfo("VR mod shutting down");
-        //g_VRSession.Shutdown();
+        g_VRSession.Shutdown();
         VRLog_Shutdown();
     }
 

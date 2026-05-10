@@ -97,6 +97,14 @@ workspace "GTAIV.EFLC.FusionFix"
     "third_party/openxr/src/loader/**.h",
     "third_party/openxr/src/common/**.cpp",
 	}
+	
+	libdirs {
+    "external/openxr/prebuilt/Win32/lib",
+	}
+
+	links {
+		"openxr_loader",
+	}
 
    prebuildcommands {
       "for /R \"../source/resources/snow/\" %%f in (*.ps) do (\"../source/dxsdk/lib/x86/fxc.exe\" /T ps_3_0 /nologo /E main /Fo \"../source/resources/snow/%%~nfps.pso\" %%f)",
