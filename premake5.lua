@@ -99,6 +99,7 @@ workspace "GTAIV.EFLC.FusionFix"
     "third_party/openxr/src/loader/**.h",
     "third_party/openxr/src/common/**.cpp",
 	}
+	files { "external/dxvk-interop/**.h" }
 	
 	libdirs {
     "external/openxr/prebuilt/Win32/lib",
