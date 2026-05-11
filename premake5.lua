@@ -102,7 +102,7 @@ workspace "GTAIV.EFLC.FusionFix"
 	files { "external/dxvk-interop/**.h" }
 	
 	libdirs {
-    "external/openxr/prebuilt/Win32/lib",
+    "external/openxr-loader/prebuilt/Win32/lib",
 	}
 
 	links {
