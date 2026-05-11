@@ -1,6 +1,8 @@
 // vr_manager.ixx
 module;
 
+#include <common.hxx>
+
 export module VR.Manager;
 
 import common;
@@ -49,9 +51,10 @@ namespace {
     struct VRBootstrap {
         VRBootstrap() {
             FusionFix::onInitEvent()      += []() { VRMod_EarlyInit(); };  // logging + OpenXR instance
-            FusionFix::onGameInitEvent()  += []() { VRMod_GraphicsInit(); }; // DXVK extraction + session
-            FusionFix::onShutdownEvent()  += []() { VRMod_Shutdown(); };
-        }
+            FusionFix::onGameInitEvent()  += []() { VRMod_GraphicsInit();};  // DXVK extraction + session	
+			FusionFix::onEndScene() += []() { g_VRSession.PollEvents();};
+			FusionFix::onShutdownEvent() += []() { VRMod_Shutdown(); };
+		}
     };
 
     VRBootstrap g_vrBootstrap;
