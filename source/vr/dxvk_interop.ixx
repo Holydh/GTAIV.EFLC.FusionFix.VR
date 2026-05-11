@@ -1,6 +1,6 @@
 module;
-
 #include <d3d9.h>
+#define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <d3d9_vk_interop.h>
 
@@ -16,6 +16,7 @@ export struct VulkanDeviceHandles {
     VkQueue          queue            = VK_NULL_HANDLE;
     uint32_t         queueFamilyIndex = 0;
     uint32_t         queueIndex       = 0;
+    ID3D9VkInteropDevice* interopDevice = nullptr; 
 };
 
 export bool ExtractVulkanHandles(VulkanDeviceHandles& out) {
@@ -25,20 +26,19 @@ export bool ExtractVulkanHandles(VulkanDeviceHandles& out) {
         return false;
     }
 
-    ID3D9VkInteropDevice* interop = nullptr;
     HRESULT hr = d3d9Device->QueryInterface(
         __uuidof(ID3D9VkInteropDevice),
-        reinterpret_cast<void**>(&interop));
+        reinterpret_cast<void**>(&out.interopDevice));
 
-    if (FAILED(hr) || !interop) {
+    if (FAILED(hr) || !out.interopDevice) {
         LogError("ID3D9VkInteropDevice not available (hr=0x%08X). "
                  "Set FusionFix graphics API to DXVK/Vulkan.", hr);
         return false;
     }
 
-    interop->GetVulkanHandles(&out.instance, &out.physicalDevice, &out.device);
-    interop->GetSubmissionQueue(&out.queue, &out.queueIndex, &out.queueFamilyIndex);
-    interop->Release();
+    out.interopDevice->GetVulkanHandles(&out.instance, &out.physicalDevice, &out.device);
+    out.interopDevice->GetSubmissionQueue(&out.queue, &out.queueIndex, &out.queueFamilyIndex);
+    //interop->Release(); // DO NOT Release() — keep the reference so we can call Lock/UnlockDevice later
 
     LogInfo("DXVK Vulkan handles extracted:");
     LogInfo("  VkInstance:       %p", (void*)out.instance);
