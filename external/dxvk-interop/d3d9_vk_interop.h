@@ -7,8 +7,8 @@
 // License: zlib
 //
 // IMPORTANT: vtable order must match DXVK exactly. Do not reorder.
-
 #include <d3d9.h>
+#define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 
 // Forward declaration — we don't need the full def, just the type for the pointer

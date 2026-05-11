@@ -1,15 +1,20 @@
-// in vr/openxr_session.ixx
 module;
 #define XR_USE_GRAPHICS_API_VULKAN
+#define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <openxr/openxr.h>
+#define VK_NO_PROTOTYPES
 #include <openxr/openxr_platform.h>
 #include <vector>
 #include <string>
+#include <thread>
+#include <atomic>
 
 export module VR.OpenXRSession;
 import VR.Log;
 import VR.DXVKInterop;
+import VR.VulkanInstance;
+import VR.VulkanLoader;
 
 // OpenXR returns XrResult for nearly every call. Macro :
 #define XR_CHECK(call) do { \
@@ -33,11 +38,13 @@ public:
     bool IsAvailable() const { return instance != XR_NULL_HANDLE && systemId != XR_NULL_SYSTEM_ID; }
     const std::string& GetSystemName() const { return systemName; }
 
-    bool CreateSession(const VulkanDeviceHandles& vk);
-
     void PollEvents();
     bool IsSessionRunning() const { return sessionRunning; }
     bool ShouldExit() const { return exitRequested; }
+
+    bool CreateSession(/*const VulkanDeviceHandles& vk*/);
+
+    void RunFrame();
 private :
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
@@ -47,17 +54,39 @@ private :
 	XrSession session = XR_NULL_HANDLE;
 	XrSpace referenceSpace = XR_NULL_HANDLE;
 	VulkanDeviceHandles vkHandles;
+    OurVulkanContext ourVulkan;
 
     std::vector<XrViewConfigurationView> viewConfigs;
 
-    XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
-    bool sessionRunning = false;
-    bool exitRequested = false;
+    XrFrameState lastFrameState{XR_TYPE_FRAME_STATE};
 
     bool CreateInstance();
     bool SetupDebugMessenger();
     bool QuerySystem();
     bool QueryViewConfiguration();
+
+    XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
+    bool sessionRunning = false;
+    bool exitRequested = false;
+
+    std::thread frameThread;
+    std::atomic<bool> stopFrameThread{false};
+    void StartFrameLoop();
+    void StopFrameLoop();
+    void FrameLoopThreadMain();
+
+	struct EyeSwapchain {
+		XrSwapchain handle = XR_NULL_HANDLE;
+		int32_t width = 0;
+		int32_t height = 0;
+		int64_t format = 0;
+		std::vector<XrSwapchainImageVulkanKHR> images;
+	};
+	std::vector<EyeSwapchain> eyeSwapchains;
+    XrEnvironmentBlendMode primaryBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    bool CreateSwapchains();
+    bool QueryBlendMode();
+    int64_t SelectColorFormat();
 };
 
 bool OpenXRSession::CreateInstance() {
@@ -255,10 +284,23 @@ bool OpenXRSession::InitializeInstance() {
 }
 
 void OpenXRSession::Shutdown() {
+    StopFrameLoop();
+
     if (referenceSpace != XR_NULL_HANDLE) {
         xrDestroySpace(referenceSpace);
         referenceSpace = XR_NULL_HANDLE;
     }
+
+	for (auto& eye : eyeSwapchains) {
+		if (eye.handle != XR_NULL_HANDLE) {
+			xrDestroySwapchain(eye.handle);
+		}
+	}
+	eyeSwapchains.clear();
+
+	vkHandles.interopDevice->Release(); // release our reference to the interop device
+    DestroyOurVulkan(ourVulkan);
+
     if (session != XR_NULL_HANDLE) {
         xrDestroySession(session);
         session = XR_NULL_HANDLE;
@@ -278,9 +320,14 @@ void OpenXRSession::Shutdown() {
     systemId = XR_NULL_SYSTEM_ID;
 }
 
-bool OpenXRSession::CreateSession(const VulkanDeviceHandles& vk) {
-    vkHandles = vk;
-    
+bool OpenXRSession::CreateSession(/*const VulkanDeviceHandles& vk*/) {
+    /*vkHandles = vk;*/
+	OurVulkanContext ourVk;
+	if (!CreateOurVulkan(instance, systemId, ourVk)) return false;
+
+	// Store ourVk somewhere on the class
+	this->ourVulkan = ourVk;
+
     // 1. Required by spec: query graphics requirements
     PFN_xrGetVulkanGraphicsRequirements2KHR pfnGetReqs = nullptr;
     XR_CHECK(xrGetInstanceProcAddr(instance, "xrGetVulkanGraphicsRequirements2KHR",
@@ -297,12 +344,20 @@ bool OpenXRSession::CreateSession(const VulkanDeviceHandles& vk) {
         XR_VERSION_PATCH(reqs.maxApiVersionSupported));
     
     // 2. Create session with DXVK Vulkan handles
+    //XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
+    //binding.instance         = vk.instance;
+    //binding.physicalDevice   = vk.physicalDevice;
+    //binding.device           = vk.device;
+    //binding.queueFamilyIndex = vk.queueFamilyIndex;
+    //binding.queueIndex       = vk.queueIndex;
+
+        // Session binding now uses OUR Vulkan, not DXVK's
     XrGraphicsBindingVulkanKHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR};
-    binding.instance         = vk.instance;
-    binding.physicalDevice   = vk.physicalDevice;
-    binding.device           = vk.device;
-    binding.queueFamilyIndex = vk.queueFamilyIndex;
-    binding.queueIndex       = vk.queueIndex;
+    binding.instance         = ourVk.instance;
+    binding.physicalDevice   = ourVk.physicalDevice;
+    binding.device           = ourVk.device;
+    binding.queueFamilyIndex = ourVk.queueFamilyIndex;
+    binding.queueIndex       = 0;
     
     XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
     sci.next     = &binding;
@@ -345,6 +400,13 @@ bool OpenXRSession::CreateSession(const VulkanDeviceHandles& vk) {
 		LogError("Expected 2 views for stereo");
 		return false;
 	}
+
+	if (!QueryBlendMode()) {
+		LogError("No blend modes available");
+		return false;
+	}
+
+    StartFrameLoop();
 
     LogInfo("OpenXR Milestone 2 complete: session + reference space ready");
     return true;
@@ -434,4 +496,195 @@ void OpenXRSession::PollEvents() {
         
         event = {XR_TYPE_EVENT_DATA_BUFFER};
     }
+}
+
+void OpenXRSession::RunFrame() {
+	static int callCount = 0;
+	callCount++;
+	if (callCount % 100 == 0) LogInfo("RunFrame call #%d", callCount);
+
+    if (!sessionRunning || session == XR_NULL_HANDLE) return;
+    
+    XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
+    XrFrameState frameState{XR_TYPE_FRAME_STATE};
+    XrResult r = xrWaitFrame(session, &waitInfo, &frameState);
+    if (XR_FAILED(r)) {
+        LogError("xrWaitFrame failed: %d", r);
+        return;
+    }
+    
+    static int frameCount = 0;
+    if (frameCount < 5) {
+        LogInfo("Frame %d: predictedDisplayTime=%lld shouldRender=%d period=%lld",
+            frameCount, (long long)frameState.predictedDisplayTime,
+            frameState.shouldRender, (long long)frameState.predictedDisplayPeriod);
+    }
+    frameCount++;
+    
+    XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
+    r = xrBeginFrame(session, &beginInfo);
+    if (r == XR_FRAME_DISCARDED) {
+        // Still need to call xrEndFrame per spec
+        LogWarn("xrBeginFrame returned XR_FRAME_DISCARDED");
+    } else if (XR_FAILED(r)) {
+        LogError("xrBeginFrame failed: %d (frame %d)", r, frameCount);
+        return;
+    }
+    
+    XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
+    endInfo.displayTime = frameState.predictedDisplayTime;
+    endInfo.environmentBlendMode = primaryBlendMode;
+    endInfo.layerCount = 0;
+    endInfo.layers = nullptr;
+
+	r = xrEndFrame(session, &endInfo);
+	if (r != XR_SUCCESS) {
+		char errName[XR_MAX_RESULT_STRING_SIZE] = "?";
+		xrResultToString(instance, r, errName);
+		LogError("xrEndFrame: %s (displayTime=%lld)", errName,
+			(long long)endInfo.displayTime);
+	}
+}
+
+void OpenXRSession::StartFrameLoop() {
+    stopFrameThread = false;
+    frameThread = std::thread([this]() { FrameLoopThreadMain(); });
+    LogInfo("OpenXR frame thread started");
+}
+
+void OpenXRSession::StopFrameLoop() {
+    stopFrameThread = true;
+    if (frameThread.joinable()) frameThread.join();
+    LogInfo("OpenXR frame thread stopped");
+}
+
+void OpenXRSession::FrameLoopThreadMain() {
+    LogInfo("Frame thread: creating swapchains...");
+    if (!CreateSwapchains()) {
+        LogError("Frame thread: swapchain creation failed");
+        return;
+    }
+    LogInfo("Frame thread: swapchains ready, entering loop");
+    
+    while (!stopFrameThread) {
+        if (!sessionRunning || stopFrameThread) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+        RunFrame();
+    }
+}
+
+bool OpenXRSession::QueryBlendMode() {
+    uint32_t count = 0;
+    XR_CHECK(xrEnumerateEnvironmentBlendModes(instance, systemId,
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &count, nullptr));
+    std::vector<XrEnvironmentBlendMode> modes(count);
+    XR_CHECK(xrEnumerateEnvironmentBlendModes(instance, systemId,
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, count, &count, modes.data()));
+    
+    LogInfo("Supported blend modes (%u):", count);
+    for (auto m : modes) LogInfo("  mode %d", m);
+    
+    if (count == 0) return false;
+    primaryBlendMode = modes[0];
+    LogInfo("Selected blend mode: %d", primaryBlendMode);
+    return true;
+}
+
+int64_t OpenXRSession::SelectColorFormat() {
+    uint32_t count = 0;
+    xrEnumerateSwapchainFormats(session, 0, &count, nullptr);
+    std::vector<int64_t> formats(count);
+    xrEnumerateSwapchainFormats(session, count, &count, formats.data());
+    
+    LogInfo("Supported swapchain formats (%u):", count);
+    for (auto f : formats) LogInfo("  format %lld", (long long)f);
+    
+    // Prefer common sRGB formats. Match VkFormat values.
+    const int64_t preferred[] = {
+        VK_FORMAT_R8G8B8A8_SRGB,
+        VK_FORMAT_B8G8R8A8_SRGB,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FORMAT_B8G8R8A8_UNORM,
+    };
+    for (auto p : preferred) {
+        for (auto f : formats) {
+            if (f == p) {
+                LogInfo("Selected color format: %lld", (long long)f);
+                return f;
+            }
+        }
+    }
+    // Fallback: first available
+    return formats.empty() ? 0 : formats[0];
+}
+
+bool OpenXRSession::CreateSwapchains() {
+    if (viewConfigs.size() != 2) return false;
+    
+    int64_t format = SelectColorFormat();
+    if (format == 0) {
+        LogError("No supported swapchain format");
+        return false;
+    }
+    
+    eyeSwapchains.resize(2);
+    
+    for (size_t i = 0; i < 2; ++i) {
+        auto& eye = eyeSwapchains[i];
+        const auto& vc = viewConfigs[i];
+
+        eye.width  = vc.recommendedImageRectWidth;
+        eye.height = vc.recommendedImageRectHeight;
+        eye.format = format;
+        
+        XrSwapchainCreateInfo sci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+        sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                         XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+                         XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+        sci.format       = format;
+        sci.sampleCount  = 1;
+        sci.width        = eye.width;
+        sci.height       = eye.height;
+        sci.faceCount    = 1;
+        sci.arraySize    = 1;
+        sci.mipCount     = 1;
+
+		LogInfo("Creating swapchain for eye %zu...", i);
+		XR_CHECK(xrCreateSwapchain(session, &sci, &eye.handle));
+		LogInfo("Swapchain handle: %p", (void*)eye.handle);
+
+		uint32_t imageCount = 0;
+		LogInfo("Querying image count...");
+		XR_CHECK(xrEnumerateSwapchainImages(eye.handle, 0, &imageCount, nullptr));
+		LogInfo("Image count: %u", imageCount);
+
+        eye.images.clear();
+		eye.images.resize(imageCount);
+		for (auto& img : eye.images) {
+			img.type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+			img.next = nullptr;
+			img.image = VK_NULL_HANDLE;
+		}
+
+        LogInfo("sizeof(XrSwapchainImageVulkanKHR) = %zu", sizeof(XrSwapchainImageVulkanKHR));
+        LogInfo("sizeof(VkImage) = %zu", sizeof(VkImage));
+
+        LogInfo("Address of images[0]: %p", &eye.images[0]);
+        LogInfo("eye.images.size() = %zu, capacity = %zu", eye.images.size(), eye.images.capacity());
+
+		LogInfo("Enumerating images...");
+		XR_CHECK(xrEnumerateSwapchainImages(eye.handle, imageCount, &imageCount,
+			reinterpret_cast<XrSwapchainImageBaseHeader*>(eye.images.data())));
+		LogInfo("Eye %zu done", i);
+
+		LogInfo("Eye %zu swapchain: %dx%d, %u images, handle=%p",
+            i, eye.width, eye.height, imageCount, (void*)eye.handle);
+        for (uint32_t j = 0; j < imageCount; ++j) {
+            LogInfo("  image %u: VkImage=%p", j, (void*)eye.images[j].image);
+        }
+    }
+    
+    return true;
 }
