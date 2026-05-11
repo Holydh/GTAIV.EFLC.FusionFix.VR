@@ -34,6 +34,10 @@ public:
     const std::string& GetSystemName() const { return systemName; }
 
     bool CreateSession(const VulkanDeviceHandles& vk);
+
+    void PollEvents();
+    bool IsSessionRunning() const { return sessionRunning; }
+    bool ShouldExit() const { return exitRequested; }
 private :
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
@@ -44,9 +48,16 @@ private :
 	XrSpace referenceSpace = XR_NULL_HANDLE;
 	VulkanDeviceHandles vkHandles;
 
+    std::vector<XrViewConfigurationView> viewConfigs;
+
+    XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
+    bool sessionRunning = false;
+    bool exitRequested = false;
+
     bool CreateInstance();
     bool SetupDebugMessenger();
     bool QuerySystem();
+    bool QueryViewConfiguration();
 };
 
 bool OpenXRSession::CreateInstance() {
@@ -329,7 +340,98 @@ bool OpenXRSession::CreateSession(const VulkanDeviceHandles& vk) {
     
     XR_CHECK(xrCreateReferenceSpace(session, &rsci, &referenceSpace));
     LogInfo("Reference space created (LOCAL): %p", (void*)referenceSpace);
-    
+
+	if (!QueryViewConfiguration()) {
+		LogError("Expected 2 views for stereo");
+		return false;
+	}
+
     LogInfo("OpenXR Milestone 2 complete: session + reference space ready");
     return true;
+}
+
+bool OpenXRSession::QueryViewConfiguration() {
+    uint32_t viewCount = 0;
+    XR_CHECK(xrEnumerateViewConfigurationViews(instance, systemId,
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &viewCount, nullptr));
+    
+    viewConfigs.assign(viewCount, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+    XR_CHECK(xrEnumerateViewConfigurationViews(instance, systemId,
+        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, viewCount, &viewCount, viewConfigs.data()));
+    
+    LogInfo("View configuration (stereo, %u views):", viewCount);
+    for (uint32_t i = 0; i < viewCount; ++i) {
+        const auto& v = viewConfigs[i];
+        LogInfo("  Eye %u: recommended %ux%u (max %ux%u), samples %u (max %u)",
+            i,
+            v.recommendedImageRectWidth, v.recommendedImageRectHeight,
+            v.maxImageRectWidth, v.maxImageRectHeight,
+            v.recommendedSwapchainSampleCount, v.maxSwapchainSampleCount);
+    }
+    
+    return viewCount == 2;
+}
+
+void OpenXRSession::PollEvents() {
+    if (instance == XR_NULL_HANDLE) return;
+    
+    XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
+    
+    while (xrPollEvent(instance, &event) == XR_SUCCESS) {
+        switch (event.type) {
+            case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED: {
+                auto* e = reinterpret_cast<XrEventDataSessionStateChanged*>(&event);
+                LogInfo("Session state: %d -> %d", sessionState, e->state);
+                sessionState = e->state;
+                
+                switch (sessionState) {
+                    case XR_SESSION_STATE_READY: {
+                        XrSessionBeginInfo bi{XR_TYPE_SESSION_BEGIN_INFO};
+                        bi.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                        XrResult r = xrBeginSession(session, &bi);
+                        if (XR_FAILED(r)) {
+                            LogError("xrBeginSession failed: %d", r);
+                        } else {
+                            sessionRunning = true;
+                            LogInfo("Session begun (running)");
+                        }
+                        break;
+                    }
+                    case XR_SESSION_STATE_STOPPING: {
+                        sessionRunning = false;
+                        XrResult r = xrEndSession(session);
+                        if (XR_FAILED(r)) LogError("xrEndSession failed: %d", r);
+                        else LogInfo("Session ended");
+                        break;
+                    }
+                    case XR_SESSION_STATE_EXITING:
+                    case XR_SESSION_STATE_LOSS_PENDING:
+                        exitRequested = true;
+                        break;
+                    default:
+                        break;
+                }
+                break;
+            }
+            
+            case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+                LogWarn("OpenXR instance loss pending");
+                exitRequested = true;
+                break;
+            
+            case XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED:
+                LogInfo("Interaction profile changed");
+                break;
+            
+            case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
+                LogInfo("Reference space change pending");
+                break;
+            
+            default:
+                LogInfo("Unhandled OpenXR event type: %d", event.type);
+                break;
+        }
+        
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
 }
