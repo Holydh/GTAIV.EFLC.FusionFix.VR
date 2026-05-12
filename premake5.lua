@@ -84,7 +84,6 @@ workspace "GTAIV.EFLC.FusionFix"
    includedirs { "external/injector/include" }
    includedirs { "external/inireader" }
    includedirs { "external/modupdater/dist" }
-   includedirs { "external/openxr/include" }
    includedirs { "external/dxvk-interop" }
    includedirs { "external/vulkan-headers/include" }
    includedirs { "source/gxt/src" }
@@ -94,20 +93,7 @@ workspace "GTAIV.EFLC.FusionFix"
    files { "external/injector/zydis/**.h", "external/injector/zydis/**.c" }
    files { "source/gxt/src/**.h", "source/gxt/src/**.cpp" }
    files { "data/plugins/*.ini" }
-   files {
-    "third_party/openxr/src/loader/**.cpp",
-    "third_party/openxr/src/loader/**.h",
-    "third_party/openxr/src/common/**.cpp",
-	}
 	files { "external/dxvk-interop/**.h" }
-	
-	libdirs {
-    "external/openxr-loader/prebuilt/Win32/lib",
-	}
-
-	links {
-		"openxr_loader",
-	}
 
    prebuildcommands {
       "for /R \"../source/resources/snow/\" %%f in (*.ps) do (\"../source/dxsdk/lib/x86/fxc.exe\" /T ps_3_0 /nologo /E main /Fo \"../source/resources/snow/%%~nfps.pso\" %%f)",
