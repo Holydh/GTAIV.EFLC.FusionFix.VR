@@ -113,7 +113,10 @@ bool CreateOurVulkan(XrInstance xrInstance, XrSystemId xrSystemId, OurVulkanCont
         LogError("xrCreateVulkanDeviceKHR failed: xr=%d vk=%d", r, vkResult);
         return false;
     }
-    LogInfo("Our VkDevice: %p", (void*)out.device);  
+    LogInfo("Our VkDevice: %p", (void*)out.device);
+
+    vkGetDeviceQueue(out.device, out.queueFamilyIndex, 0, &out.queue);
+    LogInfo("Our VkQueue: %p", (void*)out.queue);
     return true;
 }
 

@@ -16,6 +16,21 @@ export PFN_vkCreateDevice                   vkCreateDevice         = nullptr;
 export PFN_vkDestroyDevice                  vkDestroyDevice        = nullptr;
 export PFN_vkGetDeviceQueue                 vkGetDeviceQueue       = nullptr;
 export PFN_vkGetDeviceProcAddr              vkGetDeviceProcAddr    = nullptr;
+export PFN_vkCreateCommandPool             vkCreateCommandPool            = nullptr;
+export PFN_vkDestroyCommandPool            vkDestroyCommandPool           = nullptr;
+export PFN_vkAllocateCommandBuffers        vkAllocateCommandBuffers       = nullptr;
+export PFN_vkFreeCommandBuffers            vkFreeCommandBuffers           = nullptr;
+export PFN_vkBeginCommandBuffer            vkBeginCommandBuffer           = nullptr;
+export PFN_vkEndCommandBuffer              vkEndCommandBuffer             = nullptr;
+export PFN_vkResetCommandBuffer            vkResetCommandBuffer           = nullptr;
+export PFN_vkQueueSubmit                   vkQueueSubmit                  = nullptr;
+export PFN_vkQueueWaitIdle                 vkQueueWaitIdle                = nullptr;
+export PFN_vkCmdClearColorImage            vkCmdClearColorImage           = nullptr;
+export PFN_vkCmdPipelineBarrier            vkCmdPipelineBarrier           = nullptr;
+
+export PFN_vkCreateFence                 vkCreateFence                = nullptr;
+export PFN_vkDestroyFence            vkDestroyFence           = nullptr;
+export PFN_vkWaitForFences            vkWaitForFences           = nullptr;
 
 namespace {
     HMODULE g_vulkanModule = nullptr;
@@ -53,8 +68,22 @@ export void LoadVulkanInstanceFunctions(VkInstance instance) {
     LOAD(vkCreateDevice);
     LOAD(vkDestroyDevice);
     LOAD(vkGetDeviceQueue);
-    LOAD(vkGetDeviceProcAddr);
-    #undef LOAD
+	LOAD(vkGetDeviceProcAddr);
+	LOAD(vkCreateCommandPool);
+	LOAD(vkDestroyCommandPool);
+	LOAD(vkAllocateCommandBuffers);
+	LOAD(vkFreeCommandBuffers);
+	LOAD(vkBeginCommandBuffer);
+	LOAD(vkEndCommandBuffer);
+	LOAD(vkResetCommandBuffer);
+	LOAD(vkQueueSubmit);
+	LOAD(vkQueueWaitIdle);
+	LOAD(vkCmdClearColorImage);
+	LOAD(vkCmdPipelineBarrier);
+	LOAD(vkCreateFence);
+	LOAD(vkDestroyFence);
+	LOAD(vkWaitForFences);
+#undef LOAD
 }
 
 // Call after creating VkDevice to resolve device-level functions
