@@ -68,6 +68,7 @@ private :
     XrSessionState sessionState = XR_SESSION_STATE_UNKNOWN;
     bool sessionRunning = false;
     bool exitRequested = false;
+    std::atomic<bool> sessionFullyInitialized{false};
 
     std::thread frameThread;
     std::atomic<bool> stopFrameThread{false};
@@ -87,6 +88,11 @@ private :
     bool CreateSwapchains();
     bool QueryBlendMode();
     int64_t SelectColorFormat();
+
+    VkCommandPool   cmdPool   = VK_NULL_HANDLE;
+    VkCommandBuffer cmdBuffer = VK_NULL_HANDLE;
+    std::vector<XrView> views;
+    void ClearSwapchainImage(VkImage image, uint32_t eyeIndex);
 };
 
 bool OpenXRSession::CreateInstance() {
@@ -299,6 +305,12 @@ void OpenXRSession::Shutdown() {
 	eyeSwapchains.clear();
 
 	vkHandles.interopDevice->Release(); // release our reference to the interop device
+
+    if (cmdPool != VK_NULL_HANDLE) {
+    vkDestroyCommandPool(ourVulkan.device, cmdPool, nullptr);
+    cmdPool = VK_NULL_HANDLE;
+    }
+
     DestroyOurVulkan(ourVulkan);
 
     if (session != XR_NULL_HANDLE) {
@@ -324,9 +336,29 @@ bool OpenXRSession::CreateSession(/*const VulkanDeviceHandles& vk*/) {
     /*vkHandles = vk;*/
 	OurVulkanContext ourVk;
 	if (!CreateOurVulkan(instance, systemId, ourVk)) return false;
-
 	// Store ourVk somewhere on the class
 	this->ourVulkan = ourVk;
+
+
+	// Allocate command pool + buffer for our submissions
+	VkCommandPoolCreateInfo cpci{ VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO };
+	cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+	cpci.queueFamilyIndex = ourVulkan.queueFamilyIndex;
+	if (vkCreateCommandPool(ourVulkan.device, &cpci, nullptr, &cmdPool) != VK_SUCCESS) {
+		LogError("vkCreateCommandPool failed"); return false;
+	}
+
+	VkCommandBufferAllocateInfo cbai{ VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO };
+	cbai.commandPool = cmdPool;
+	cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+	cbai.commandBufferCount = 1;
+	if (vkAllocateCommandBuffers(ourVulkan.device, &cbai, &cmdBuffer) != VK_SUCCESS) {
+		LogError("vkAllocateCommandBuffers failed"); return false;
+	}
+
+	views.assign(2, { XR_TYPE_VIEW });
+
+
 
     // 1. Required by spec: query graphics requirements
     PFN_xrGetVulkanGraphicsRequirements2KHR pfnGetReqs = nullptr;
@@ -408,6 +440,8 @@ bool OpenXRSession::CreateSession(/*const VulkanDeviceHandles& vk*/) {
 
     StartFrameLoop();
 
+    sessionFullyInitialized = true;
+
     LogInfo("OpenXR Milestone 2 complete: session + reference space ready");
     return true;
 }
@@ -435,7 +469,7 @@ bool OpenXRSession::QueryViewConfiguration() {
 }
 
 void OpenXRSession::PollEvents() {
-    if (instance == XR_NULL_HANDLE) return;
+    if (instance == XR_NULL_HANDLE || !sessionFullyInitialized) return;
     
     XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
     
@@ -485,9 +519,11 @@ void OpenXRSession::PollEvents() {
                 LogInfo("Interaction profile changed");
                 break;
             
-            case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
-                LogInfo("Reference space change pending");
+            case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING: {
+                auto* e = reinterpret_cast<XrEventDataReferenceSpaceChangePending*>(&event);
+				LogInfo("Reference space change pending: type=%d", e->referenceSpaceType);
                 break;
+            }
             
             default:
                 LogInfo("Unhandled OpenXR event type: %d", event.type);
@@ -499,50 +535,120 @@ void OpenXRSession::PollEvents() {
 }
 
 void OpenXRSession::RunFrame() {
-	static int callCount = 0;
-	callCount++;
-	if (callCount % 100 == 0) LogInfo("RunFrame call #%d", callCount);
-
+    static int firstCall = 0;
+    if (firstCall < 3) {
+        firstCall++;
+        LogInfo("RunFrame entered (state=%d)", sessionState);
+    }
     if (!sessionRunning || session == XR_NULL_HANDLE) return;
-    
+    auto t0 = std::chrono::steady_clock::now();
     XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState frameState{XR_TYPE_FRAME_STATE};
-    XrResult r = xrWaitFrame(session, &waitInfo, &frameState);
-    if (XR_FAILED(r)) {
-        LogError("xrWaitFrame failed: %d", r);
-        return;
-    }
-    
-    static int frameCount = 0;
-    if (frameCount < 5) {
-        LogInfo("Frame %d: predictedDisplayTime=%lld shouldRender=%d period=%lld",
-            frameCount, (long long)frameState.predictedDisplayTime,
-            frameState.shouldRender, (long long)frameState.predictedDisplayPeriod);
-    }
-    frameCount++;
-    
+    if (XR_FAILED(xrWaitFrame(session, &waitInfo, &frameState))) return;
+    auto t1 = std::chrono::steady_clock::now();
     XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
-    r = xrBeginFrame(session, &beginInfo);
-    if (r == XR_FRAME_DISCARDED) {
-        // Still need to call xrEndFrame per spec
-        LogWarn("xrBeginFrame returned XR_FRAME_DISCARDED");
-    } else if (XR_FAILED(r)) {
-        LogError("xrBeginFrame failed: %d (frame %d)", r, frameCount);
-        return;
-    }
+    if (XR_FAILED(xrBeginFrame(session, &beginInfo))) return;
     
-    XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
-    endInfo.displayTime = frameState.predictedDisplayTime;
-    endInfo.environmentBlendMode = primaryBlendMode;
-    endInfo.layerCount = 0;
-    endInfo.layers = nullptr;
+    std::vector<XrCompositionLayerBaseHeader*> layers;
+    XrCompositionLayerProjection projLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    std::vector<XrCompositionLayerProjectionView> projViews;
+    
+    auto t2 = std::chrono::steady_clock::now();
+    if (frameState.shouldRender) {
+        // Locate views
+        XrViewLocateInfo li{XR_TYPE_VIEW_LOCATE_INFO};
+        li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        li.displayTime = frameState.predictedDisplayTime;
+        li.space = referenceSpace;
+        
+        XrViewState viewState{XR_TYPE_VIEW_STATE};
+        uint32_t viewCount = 0;
+        XrResult vr = xrLocateViews(session, &li, &viewState,
+            (uint32_t)views.size(), &viewCount, views.data());
+        
+        bool posesValid = !XR_FAILED(vr) &&
+            (viewState.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) &&
+            (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
 
-	r = xrEndFrame(session, &endInfo);
-	if (r != XR_SUCCESS) {
-		char errName[XR_MAX_RESULT_STRING_SIZE] = "?";
-		xrResultToString(instance, r, errName);
-		LogError("xrEndFrame: %s (displayTime=%lld)", errName,
-			(long long)endInfo.displayTime);
+		static int frameLog = 0;
+		if (frameLog++ < 200 && frameLog % 30 == 0) {
+			LogInfo("Frame: posesValid=%d view0 pos=(%.2f,%.2f,%.2f) quat=(%.2f,%.2f,%.2f,%.2f)",
+				posesValid,
+				views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
+				views[0].pose.orientation.x, views[0].pose.orientation.y,
+				views[0].pose.orientation.z, views[0].pose.orientation.w);
+		}
+        
+        if (posesValid) {
+            projViews.resize(viewCount);
+
+            for (uint32_t i = 0; i < viewCount; ++i) {
+                auto& eye = eyeSwapchains[i];
+                
+				// Acquire image
+				uint32_t imageIndex = 0;
+				XrSwapchainImageAcquireInfo ai{ XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+				XrResult ar = xrAcquireSwapchainImage(eye.handle, &ai, &imageIndex);
+				if (XR_FAILED(ar)) {
+					LogWarn("xrAcquireSwapchainImage eye %u failed: %d", i, ar);
+					continue;
+				}
+
+                XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+                wi.timeout = XR_INFINITE_DURATION;
+				XrResult wr = xrWaitSwapchainImage(eye.handle, &wi);
+				if (XR_FAILED(wr)) {
+					LogWarn("xrWaitSwapchainImage eye %u failed: %d", i, wr);
+					XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+					xrReleaseSwapchainImage(eye.handle, &ri);
+					continue;
+				}
+                
+                // Clear the acquired image to a color via Vulkan
+                ClearSwapchainImage(eye.images[imageIndex].image, i);
+                
+				XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+				XrResult rr = xrReleaseSwapchainImage(eye.handle, &ri);
+				if (XR_FAILED(rr)) {
+					LogWarn("xrReleaseSwapchainImage eye %u failed: %d", i, rr);
+				}
+
+                // Fill projection view
+                projViews[i] = {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+                projViews[i].pose = views[i].pose;
+                projViews[i].fov  = views[i].fov;
+                projViews[i].subImage.swapchain        = eye.handle;
+                projViews[i].subImage.imageRect.offset = {0, 0};
+                projViews[i].subImage.imageRect.extent = {eye.width, eye.height};
+                projViews[i].subImage.imageArrayIndex  = 0;
+            }
+            
+            projLayer.space      = referenceSpace;
+            projLayer.viewCount  = (uint32_t)projViews.size();
+            projLayer.views      = projViews.data();
+            layers.push_back(reinterpret_cast<XrCompositionLayerBaseHeader*>(&projLayer));
+        }
+    }
+    auto t3 = std::chrono::steady_clock::now();
+    XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
+    endInfo.displayTime          = frameState.predictedDisplayTime;
+    endInfo.environmentBlendMode = primaryBlendMode;
+    endInfo.layerCount           = (uint32_t)layers.size();
+    endInfo.layers               = layers.empty() ? nullptr : layers.data();
+    
+	XrResult endResult = xrEndFrame(session, &endInfo);
+	if (endResult != XR_SUCCESS) {
+		LogWarn("xrEndFrame returned %d", endResult);
+	}
+	auto t4 = std::chrono::steady_clock::now();
+	static int n = 0;
+	if (n++ < 30) {
+		using namespace std::chrono;
+		LogInfo("Frame timing: wait=%lldus begin=%lldus render=%lldus end=%lldus",
+			duration_cast<microseconds>(t1 - t0).count(),
+			duration_cast<microseconds>(t2 - t1).count(),
+			duration_cast<microseconds>(t3 - t2).count(),
+			duration_cast<microseconds>(t4 - t3).count());
 	}
 }
 
@@ -635,8 +741,8 @@ bool OpenXRSession::CreateSwapchains() {
         auto& eye = eyeSwapchains[i];
         const auto& vc = viewConfigs[i];
 
-        eye.width  = vc.recommendedImageRectWidth;
-        eye.height = vc.recommendedImageRectHeight;
+        eye.width = 512;//vc.recommendedImageRectWidth;
+        eye.height = 512; // vc.recommendedImageRectHeight;
         eye.format = format;
         
         XrSwapchainCreateInfo sci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -687,4 +793,63 @@ bool OpenXRSession::CreateSwapchains() {
     }
     
     return true;
+}
+
+void OpenXRSession::ClearSwapchainImage(VkImage image, uint32_t eyeIndex) {
+	//VkFence fence;
+	//VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+	//vkCreateFence(ourVulkan.device, &fci, nullptr, &fence);
+
+    vkResetCommandBuffer(cmdBuffer, 0);
+    
+    VkCommandBufferBeginInfo cbbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    cbbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cmdBuffer, &cbbi);
+    
+    // Transition: UNDEFINED -> TRANSFER_DST_OPTIMAL
+    VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toTransfer.srcAccessMask = 0;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransfer.oldLayout     = VK_IMAGE_LAYOUT_UNDEFINED;
+    toTransfer.newLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = image;
+    toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmdBuffer,
+        VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toTransfer);
+    
+    // Clear: red for left eye, blue for right
+    VkClearColorValue clearColor;
+    if (eyeIndex == 0) { clearColor = {{0.5f, 0.0f, 0.0f, 1.0f}}; }  // red
+    else               { clearColor = {{0.0f, 0.0f, 0.5f, 1.0f}}; }  // blue
+    
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cmdBuffer, image,
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearColor, 1, &range);
+    
+    // Transition: TRANSFER_DST_OPTIMAL -> COLOR_ATTACHMENT_OPTIMAL (what OpenXR expects)
+    VkImageMemoryBarrier toAttach{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toAttach.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toAttach.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toAttach.oldLayout     = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toAttach.newLayout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    toAttach.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttach.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toAttach.image = image;
+    toAttach.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmdBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+        0, 0, nullptr, 0, nullptr, 1, &toAttach);
+    
+    vkEndCommandBuffer(cmdBuffer);
+    
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmdBuffer;
+    vkQueueSubmit(ourVulkan.queue, 1, &si, VK_NULL_HANDLE);
+	//vkWaitForFences(ourVulkan.device, 1, &fence, VK_TRUE, UINT64_MAX);
+	//vkDestroyFence(ourVulkan.device, fence, nullptr);
+    //vkQueueWaitIdle(ourVulkan.queue);  // simple sync for now; optimize later
 }
