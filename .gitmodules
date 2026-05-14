@@ -14,9 +14,6 @@
 [submodule "external/modupdater"]
 	path = external/modupdater
 	url = https://github.com/ThirteenAG/modupdater
-[submodule "external/openxr"]
-	path = external/openxr
-	url = https://github.com/KhronosGroup/OpenXR-SDK
 [submodule "external/vulkan-headers"]
 	path = external/vulkan-headers
 	url = https://github.com/KhronosGroup/Vulkan-Headers.git
