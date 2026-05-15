@@ -25,8 +25,8 @@ namespace {
     struct VRBootstrap {
         VRBootstrap() {
             FusionFix::onInitEvent()      += []() { VRMod_EarlyInit(); };
-            //FusionFix::onGameInitEvent()  += []() { }; 
-			//FusionFix::onEndScene() += []() { };
+            FusionFix::onGameInitEvent()  += []() { LogInfo("onGameInitEvent"); }; 
+			FusionFix::onEndScene() += []() { LogInfo("onEndScene"); };
 			FusionFix::onShutdownEvent() += []() { VRMod_Shutdown(); };
 		}
     };
